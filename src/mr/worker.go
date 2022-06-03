@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +19,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,6 +38,8 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+var mapf func(string, string) []KeyValue
+var reducef func(string, []string) string
 
 //
 // main/mrworker.go calls this function.
@@ -35,8 +51,129 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
+	for {
+		task := CallGetFile()
+		if task.Task == "None" {
+			time.Sleep(time.Second)
+			continue
+		}
+		if task.Task == "map" {
+			MapF(mapf, task.TaskId, task.Nreduce, task.File)
+		} else {
+			RedF(reducef, task.Nmap, task.TaskId)
+		}
+	}
 
 }
+
+func MapF(mapf func(string, string) []KeyValue, mapId int, nReduce int, filename string) {
+	intermediate := make([][]KeyValue, nReduce)
+
+	file, err := os.Open(filename)
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	file.Close()
+	kva := mapf(filename, string(content))
+
+	// split kva into nReduce buckets
+	for _, v := range kva {
+		index := ihash(v.Key) % nReduce
+		intermediate[index] = append(intermediate[index], v)
+	}
+	for i := 0; i < nReduce; i++ {
+		f, err := ioutil.TempFile("./", "atomic-")
+		defer func() {
+			if err != nil {
+				f.Close()
+			}
+			os.Remove(f.Name())
+		}()
+		if err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+		enc := json.NewEncoder(f)
+		for _, kv := range intermediate[i] {
+			err := enc.Encode(&kv)
+			if err != nil {
+				fmt.Println(err.Error())
+				return
+			}
+		}
+		if err := f.Close(); err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+		os.Rename(f.Name(), fmt.Sprintf("mr-%d-%d", mapId, i))
+		CallFinish("map", mapId)
+	}
+}
+
+func RedF(reducef func(string, []string) string, nMap int, reduceId int) {
+	kva := []KeyValue{}
+	for i := 0; i < nMap; i++ {
+		file, err := os.Open(fmt.Sprintf("mr-%d-%d", i, reduceId))
+		if err != nil {
+			if os.IsExist(err) {
+				fmt.Println(err.Error())
+				return
+			}
+			continue
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+	}
+	sort.Sort(ByKey(kva))
+	f, err := ioutil.TempFile("./", "atomic-")
+	defer func() {
+		if err != nil {
+			f.Close()
+		}
+		os.Remove(f.Name())
+	}()
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(f, "%v %v\n", kva[i].Key, output)
+		i = j
+	}
+
+	if err := f.Close(); err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	err = os.Rename(f.Name(), fmt.Sprintf("mr-out-%d", reduceId))
+	CallFinish("reduce", reduceId)
+}
+
 
 //
 // example function to show how to make an RPC call to the coordinator.
@@ -65,6 +202,35 @@ func CallExample() {
 	} else {
 		fmt.Printf("call failed!\n")
 	}
+}
+
+func CallGetFile() *GetFileReply {
+	args := ExampleArgs{}
+	reply := GetFileReply{
+		Task: "None",
+	}
+	mark := call("Coordinator.GetFile", &args, &reply)
+	if !mark {
+		return nil
+	}
+	return &reply
+}
+
+type FinishArgs struct {
+	Task   string
+	TaskId int
+	// TempFileName []string
+}
+type FinishReply struct {
+}
+
+func CallFinish(Task string, TaskId int) {
+	args := FinishArgs{
+		Task:   Task,
+		TaskId: TaskId,
+	}
+	reply := FinishReply{}
+	call("Coordinator.Finish", &args, &reply)
 }
 
 //
