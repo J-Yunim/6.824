@@ -1,10 +1,24 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,7 +38,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -34,8 +47,110 @@ func Worker(mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the master.
-	// CallExample()
+	for {
+		CallGetTask(mapf, reducef)
+	}
 
+}
+
+func handleMap(mapf func(string, string) []KeyValue, args *GetTaskReply) {
+	file, err := os.Open(args.Filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", args.Filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", args.Filename)
+	}
+	file.Close()
+	kva := mapf(args.Filename, string(content))
+	intermediate := make([][]KeyValue, args.NReduce)
+	for _, v := range kva {
+		i := ihash(v.Key) % args.NReduce
+		intermediate[i] = append(intermediate[i], v)
+	}
+	for k, v := range intermediate {
+		ofile, _ := ioutil.TempFile("./", "atomic-")
+		defer func() {
+			ofile.Close()
+			os.Remove(ofile.Name())
+		}()
+		enc := json.NewEncoder(ofile)
+		for _, kv := range v {
+			err := enc.Encode(&kv)
+			if err != nil {
+				fmt.Println(err.Error())
+			}
+		}
+		if err := ofile.Close(); err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+		os.Rename(ofile.Name(), fmt.Sprintf("mr-%d-%d", args.Taskid, k))
+	}
+	CallFinishTask(args.Taskid, args.Task)
+
+}
+func handleReduce(reducef func(string, []string) string, args *GetTaskReply) {
+	kva := []KeyValue{}
+	for i := 0; i < args.NMap; i++ {
+		file, _ := os.Open(fmt.Sprintf("mr-%d-%d", i, args.Taskid))
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+	}
+	sort.Sort(ByKey(kva))
+	ofile, _ := ioutil.TempFile("./", "atomic-")
+	defer func() {
+		ofile.Close()
+		os.Remove(ofile.Name())
+	}()
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
+	}
+	if err := ofile.Close(); err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	os.Rename(ofile.Name(), fmt.Sprintf("mr-out-%d", args.Taskid))
+	CallFinishTask(args.Taskid, args.Task)
+}
+
+func CallGetTask(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string) {
+	reply := GetTaskReply{Task: "None"}
+	call("Master.GetTask", &reply, &reply)
+	if reply.Task == "None" {
+		time.Sleep(time.Second)
+	} else if reply.Task == "REDUCE" {
+		handleReduce(reducef, &reply)
+	} else if reply.Task == "MAP" {
+		handleMap(mapf, &reply)
+	}
+}
+
+func CallFinishTask(taskid int, task string) {
+	args := FinishArgs{Taskid: taskid, Task: task}
+	call("Master.Finish", &args, &args)
 }
 
 //
